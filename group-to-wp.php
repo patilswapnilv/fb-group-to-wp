@@ -3,7 +3,7 @@
 Plugin Name: Facebook Group to WordPress importer
 Plugin URI: http://tareq.wedevs.com/
 Description: Import facebook group posts to WordPress
-Version: 0.1
+Version: 0.2
 Author: Tareq Hasan
 Author URI: http://tareq.wedevs.com/
 License: GPL2
@@ -70,9 +70,16 @@ class WeDevs_FB_Group_To_WP {
 
         // Localize our plugin
         add_action( 'init', array( $this, 'localization_setup' ) );
-        add_action( 'init', array( $this, 'debug_run' ) );
         add_action( 'init', array( $this, 'register_post_type' ) );
+
+        add_action( 'init', array( $this, 'debug_run' ) );
+        add_action( 'init', array( $this, 'historical_import' ) );
         add_action( 'fbgr2wp_import', array( $this, 'do_import' ) );
+
+        add_filter( 'cron_schedules', array($this, 'cron_schedules') );
+
+        add_filter( 'get_avatar_comment_types', array( $this, 'avatar_comment_type' ) );
+        add_filter( 'get_avatar', array( $this, 'get_avatar' ), 10, 3 );
 
         add_filter( 'the_content', array( $this, 'the_content' ) );
 
@@ -83,8 +90,8 @@ class WeDevs_FB_Group_To_WP {
 
     /**
      * Registers our custom post type
-     * 
-     * @return void 
+     *
+     * @return void
      */
     public function register_post_type() {
         $labels = array(
@@ -114,7 +121,8 @@ class WeDevs_FB_Group_To_WP {
             'label'               => __( 'fb_group_post', 'fbgr2wp' ),
             'description'         => __( 'WordPress Group Post', 'fbgr2wp' ),
             'labels'              => $labels,
-            'supports'            => array( 'title', 'editor', 'post-formats', ),
+            'supports'            => array( 'title', 'editor', 'post-formats', 'comments' ),
+            'taxonomies'          => array( 'category', 'post_tag' ),
             'hierarchical'        => false,
             'public'              => true,
             'show_ui'             => true,
@@ -155,7 +163,7 @@ class WeDevs_FB_Group_To_WP {
      */
     public function activate() {
         if ( false == wp_next_scheduled( 'fbgr2wp_import' ) ){
-            wp_schedule_event( time(), 'hourly', 'fbgr2wp_import' );
+            wp_schedule_event( time(), 'half-hour', 'fbgr2wp_import' );
         }
     }
 
@@ -177,8 +185,32 @@ class WeDevs_FB_Group_To_WP {
         load_plugin_textdomain( 'fbgr2wp', false, dirname( plugin_basename( __FILE__ ) ) . '/languages/' );
     }
 
+    /**
+     * Add new cron schedule
+     *
+     * @param  array $schedules
+     * @return array
+     */
+    function cron_schedules( $schedules ) {
+        $schedules['half-hour'] = array(
+            'interval' => MINUTE_IN_SECONDS * 30,
+            'display' => __( 'In every 30 Minutes', 'fbgr2wp' )
+        );
+
+        return $schedules;
+    }
+
+    /**
+     * Manually trigger the cron
+     *
+     * @return void
+     */
     function debug_run() {
         if ( !isset( $_GET['fb2wp_test'] ) ) {
+            return;
+        }
+
+        if ( ! current_user_can( 'manage_options' ) ) {
             return;
         }
 
@@ -186,7 +218,12 @@ class WeDevs_FB_Group_To_WP {
 
         die();
     }
-    
+
+    /**
+     * Get the facebook settings
+     *
+     * @return array
+     */
     function get_settings() {
         $option = get_option( 'fbgr2wp_settings', array() );
 
@@ -204,44 +241,137 @@ class WeDevs_FB_Group_To_WP {
         if ( empty( $option['group_id'] ) ) {
             return false;
         }
-        
+
         return $option;
     }
 
     /**
+     * Do a historical or paginated import
+     *
+     * This is a clever approach to import all the posts from a group.
+     * When you visit the url http://example.com/?fb2wp_hist, it'll start it's process.
+     *
+     * The plugin will start from the recent to next page without any interaction from
+     * your end. It'll build the url and reload the page in every 5/10 seconds and impport
+     * the next posts.
+     *
+     * As it doesn't do any blocking in the server, your server will not be overloaded
+     * and any timeout wouldn't happen.
+     *
+     * @return void
+     */
+    function historical_import() {
+
+        if ( ! isset( $_GET['fb2wp_hist'] ) ) {
+            return;
+        }
+
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return;
+        }
+
+        $root_page    = add_query_arg( array( 'fb2wp_hist' => '' ), home_url() );
+        $page_num     = isset( $_GET['page'] ) ? intval( $_GET['page'] ) : 1;
+
+
+        $option       = $this->get_settings();
+        $access_token = $option['app_id'] . '|' . $option['app_secret'];
+        $group_id     = $option['group_id'];
+        $limit        = isset( $option['limit'] ) ? intval( $option['limit'] ) : 30;
+
+        $fb_url       = 'https://graph.facebook.com/' . $group_id . '/feed/?limit=' . $limit . '&access_token=' . $access_token;
+
+        // build the query URL for next page
+        if ( $page_num > 1 ) {
+            $until        = isset( $_GET['until'] ) ? $_GET['until'] : '';
+            $paging_token = isset( $_GET['paging_token'] ) ? $_GET['paging_token'] : '';
+
+            $fb_url = add_query_arg( array(
+                'until'          => $until,
+                '__paging_token' => $paging_token
+            ), $fb_url );
+        }
+
+        // do the import
+        $json_posts  = $this->fetch_stream( $fb_url );
+        $decoded     = json_decode( $json_posts );
+        $group_posts = $decoded->data;
+
+        $count       = $this->insert_posts( $group_posts, $group_id );
+
+        // show debug info
+        printf( '<strong>%d</strong> posts imported<br>', $count );
+        printf( 'Showing Page: %d<br>', $page_num );
+        printf( 'Per Page: %d<br>', $limit );
+        printf( 'Group ID: %d<br>', $group_id );
+
+        // Build the next page URL
+        // Reload the page automatically after few seconds
+        // and do it's thing without killing the server
+        if ( $page_num && property_exists( $decoded, 'paging' ) ) {
+
+            $paging = $decoded->paging;
+            parse_str( $paging->next, $next_page );
+
+            $next_page_url = add_query_arg( array(
+                'page'         => ($page_num + 1),
+                'until'        => $next_page['until'],
+                'paging_token' => $next_page['__paging_token']
+            ), $root_page );
+
+            ?>
+            <script type="text/javascript">
+                setTimeout(function(){
+                    window.location.href = '<?php echo $next_page_url; ?>';
+                }, 5000);
+            </script>
+            <?php
+        }
+
+        exit;
+    }
+
+    /**
      * Do the actual import via cron
-     * 
+     *
      * @return boolean
      */
     function do_import() {
         $option = $this->get_settings();
-        
+
         if ( !$option ) {
             return;
         }
 
         $access_token = $option['app_id'] . '|' . $option['app_secret'];
-        $group_id = $option['group_id'];
-        $url = 'https://graph.facebook.com/' . $group_id . '/feed/?access_token=' . $access_token;
+        $group_id     = $option['group_id'];
+        $limit        = isset( $option['limit'] ) ? intval( $option['limit'] ) : 30;
+        $url          = 'https://graph.facebook.com/' . $group_id . '/feed/?limit=' . $limit . '&access_token=' . $access_token;
 
-        $json_posts = $this->fetch_stream( $url );
+        $json_posts   = $this->fetch_stream( $url );
 
         if ( !$json_posts ) {
             return;
         }
 
-        $decoded = json_decode( $json_posts );
+        $decoded     = json_decode( $json_posts );
         $group_posts = $decoded->data;
-        $paging = $decoded->paging;
+        $paging      = $decoded->paging;
 
-        $count = $this->insert_posts( $group_posts, $group_id );
+        $count       = $this->insert_posts( $group_posts, $group_id );
 
         printf( '%d posts imported', $count );
     }
-    
+
+    /**
+     * Fetch group posts from facebook API
+     *
+     * @param  string $url
+     * @return string
+     */
     function fetch_stream( $url ) {
         self::log( 'debug', 'Fetching data from facebook' );
-        
+
         $request = wp_remote_get( $url );
         $json_posts = wp_remote_retrieve_body( $request );
 
@@ -249,42 +379,70 @@ class WeDevs_FB_Group_To_WP {
             self::log( 'error', 'Fetching failed with code. WP_Error' );
             return;
         }
-        
+
         if ( $request['response']['code'] != 200 ) {
             self::log( 'error', 'Fetching failed with code: ' . $request['response']['code'] );
             return false;
         }
-        
+
         return $json_posts;
     }
-    
+
     /**
      * Loop through the facebook feed and insert them
-     * 
+     *
      * @param array $group_posts
      * @return int
      */
     function insert_posts( $group_posts, $group_id ) {
         $count = 0;
-        
+
         if ( $group_posts ) {
             foreach ($group_posts as $fb_post) {
                 $post_id = $this->insert_post( $fb_post, $group_id );
 
                 if ( $post_id ) {
+
+                    if ( property_exists( $fb_post, 'comments' ) ) {
+                        $comment_count = $this->insert_comments( $post_id, $fb_post->comments->data);
+                    }
+
                     $count++;
                 }
             }
         }
-        
+
+        return $count;
+    }
+
+    /**
+     * Insert comments for a post
+     *
+     * @param  int $post_id
+     * @param  array $comments
+     * @return int
+     */
+    function insert_comments( $post_id, $comments ) {
+        $count = 0;
+
+        if ( $comments ) {
+            foreach ($comments as $comment) {
+                $comment_id = $this->insert_comment( $post_id, $comment );
+
+                if ( $comment_id ) {
+                    $count++;
+                }
+            }
+        }
+
         return $count;
     }
 
     /**
      * Check if the post already exists
-     * 
+     *
      * Checks via guid. guid = fb post link
-     * 
+     *
      * @global object $wpdb
      * @param string $fb_link_id facebook post link
      * @return boolean
@@ -292,7 +450,28 @@ class WeDevs_FB_Group_To_WP {
     function is_post_exists( $fb_link_id ) {
         global $wpdb;
 
-        $row = $wpdb->get_row( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE guid = %s AND post_status = 'publish'", $fb_link_id ) );
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE guid = %s", $fb_link_id ) );
+
+        if ( $row ) {
+            return $row->ID;
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if a comment already exists
+     *
+     * Checks via meta key in comment
+     *
+     * @global object $wpdb
+     * @param string $fb_comment_id facebook comment id
+     * @return boolean
+     */
+    function is_comment_exists( $fb_comment_id ) {
+        global $wpdb;
+
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT meta_id FROM $wpdb->commentmeta WHERE meta_key = '_fb_comment_id' AND meta_value = %s", $fb_comment_id ) );
 
         if ( $row ) {
             return true;
@@ -303,7 +482,7 @@ class WeDevs_FB_Group_To_WP {
 
     /**
      * Insert a new imported post from facebook
-     * 
+     *
      * @param object $fb_post
      * @param int $group_id
      * @return int|WP_Error
@@ -311,39 +490,46 @@ class WeDevs_FB_Group_To_WP {
     function insert_post( $fb_post, $group_id ) {
 
         // bail out if the post already exists
-        if ( $this->is_post_exists( $fb_post->actions[0]->link )) {
-            return;
+        if ( $post_id = $this->is_post_exists( $fb_post->actions[0]->link ) ) {
+            return $post_id;
         }
 
+        $option = get_option( 'fbgr2wp_settings', array(
+            'post_status'    => 'publish',
+            'comment_status' => 'open'
+        ) );
+
         $postarr = array(
-            'post_type' => $this->post_type,
-            'post_status' => 'publish',
-            'post_author' => 1,
-            'post_date' => gmdate( 'Y-m-d H:i:s', strtotime( $fb_post->created_time ) ),
-            'guid' => $fb_post->actions[0]->link
+            'post_type'      => $this->post_type,
+            'post_status'    => $option['post_status'],
+            'comment_status' => isset( $option['comment_status'] ) ? $option['comment_status'] : 'open',
+            'ping_status'    => isset( $option['comment_status'] ) ? $option['comment_status'] : 'open',
+            'post_author'    => 1,
+            'post_date'      => gmdate( 'Y-m-d H:i:s', ( strtotime( $fb_post->created_time ) ) + ( get_option( 'gmt_offset' ) * HOUR_IN_SECONDS ) ),
+            'guid'           => $fb_post->actions[0]->link
         );
 
         $meta = array(
-            '_fb_author_id' => $fb_post->from->id,
+            '_fb_author_id'   => $fb_post->from->id,
             '_fb_author_name' => $fb_post->from->name,
-            '_fb_link' => $fb_post->actions[0]->link,
-            '_fb_group_id' => $group_id,
-            '_fb_post_id' => $fb_post->id
+            '_fb_link'        => $fb_post->actions[0]->link,
+            '_fb_group_id'    => $group_id,
+            '_fb_post_id'     => $fb_post->id
         );
 
         switch ($fb_post->type) {
             case 'status':
-                $postarr['post_title'] = wp_trim_words( strip_tags( $fb_post->message ), 6, '...' );
+                $postarr['post_title']   = wp_trim_words( strip_tags( $fb_post->message ), 10, '...' );
                 $postarr['post_content'] = $fb_post->message;
                 break;
 
             case 'photo':
 
                 if ( !isset( $fb_post->message ) ) {
-                    $postarr['post_title'] = wp_trim_words( strip_tags( $fb_post->story ), 6, '...' );
+                    $postarr['post_title']   = wp_trim_words( strip_tags( $fb_post->story ), 10, '...' );
                     $postarr['post_content'] = sprintf( '<p>%1$s</p> <div class="image-wrap"><img src="%2$s" alt="%1$s" /></div>', $fb_post->story, $fb_post->picture );
                 } else {
-                    $postarr['post_title'] = wp_trim_words( strip_tags( $fb_post->message ), 6, '...' );
+                    $postarr['post_title']   = wp_trim_words( strip_tags( $fb_post->message ), 10, '...' );
                     $postarr['post_content'] = sprintf( '<p>%1$s</p> <div class="image-wrap"><img src="%2$s" alt="%1$s" /></div>', $fb_post->message, $fb_post->picture );
                 }
 
@@ -352,7 +538,7 @@ class WeDevs_FB_Group_To_WP {
             case 'link':
                 parse_str( $fb_post->picture, $parsed_link );
 
-                $postarr['post_title'] = wp_trim_words( strip_tags( $fb_post->message ), 6, '...' );
+                $postarr['post_title'] = wp_trim_words( strip_tags( $fb_post->message ), 10, '...' );
                 $postarr['post_content'] = '<p>' . $fb_post->message . '</p>';
 
                 if ( !empty( $parsed_link['url']) ) {
@@ -381,16 +567,54 @@ class WeDevs_FB_Group_To_WP {
             }
         }
 
-        // var_dump( $fb_post );
-        // var_dump( $postarr );
-        // var_dump( $meta );
-
         return $post_id;
     }
 
     /**
+     * Insert a comment in a post
+     *
+     * @param  int $post_id
+     * @param  stdClass $fb_comment
+     * @return void
+     */
+    function insert_comment( $post_id, $fb_comment ) {
+
+        // bail out if the comment already exists
+        if ( $this->is_comment_exists( $fb_comment->id ) ) {
+            return;
+        }
+
+        $commentarr = array(
+            'comment_post_ID'    => $post_id,
+            'comment_author'     => $fb_comment->from->name,
+            'comment_author_url' => 'https://facebook.com/' . $fb_comment->from->id,
+            'comment_content'    => $fb_comment->message,
+            'comment_date'       => gmdate( 'Y-m-d H:i:s', ( strtotime( $fb_comment->created_time ) + ( get_option( 'gmt_offset' ) * HOUR_IN_SECONDS ) ) ),
+            'comment_approved'   => 1,
+            'comment_type'       => 'fb_group_post'
+        );
+
+        $meta = array(
+            '_fb_author_id'   => $fb_comment->from->id,
+            '_fb_comment_id'  => $fb_comment->id
+        );
+
+        $comment_id = wp_insert_comment( $commentarr );
+
+        if ( $comment_id && !is_wp_error( $comment_id ) ) {
+            foreach ($meta as $key => $value) {
+                update_comment_meta( $comment_id, $key, $value );
+            }
+        }
+
+        self::log( 'debug', 'comment is being inserted with FBID '.$fb_comment->id);
+
+        return $comment_id;
+    }
+
+    /**
      * Trash all imported posts
-     * 
+     *
      * @return void
      */
     function trash_all() {
@@ -407,7 +631,7 @@ class WeDevs_FB_Group_To_WP {
 
     /**
      * Adds author, post and group link to the end of the post
-     * 
+     *
      * @global object $post
      * @param string $content
      * @return string
@@ -416,10 +640,10 @@ class WeDevs_FB_Group_To_WP {
         global $post;
 
         if ( $post->post_type == $this->post_type ) {
-            $author_id = get_post_meta( $post->ID, '_fb_author_id', true );
+            $author_id   = get_post_meta( $post->ID, '_fb_author_id', true );
             $author_name = get_post_meta( $post->ID, '_fb_author_name', true );
-            $link = get_post_meta( $post->ID, '_fb_link', true );
-            $group_id = get_post_meta( $post->ID, '_fb_group_id', true );
+            $link        = get_post_meta( $post->ID, '_fb_link', true );
+            $group_id    = get_post_meta( $post->ID, '_fb_group_id', true );
 
             $author_link = sprintf( '<a href="https://facebook.com/profile.php?id=%d" target="_blank">%s</a>', $author_id, $author_name );
 
@@ -431,10 +655,55 @@ class WeDevs_FB_Group_To_WP {
             $custom_data .= sprintf( '<a href="https://facebook.com/groups/%s" target="_blank">%s</a>', $group_id, __( 'View Group', 'fbgr2wp' ) );
             $custom_data .= '</div>';
 
+            $custom_data = apply_filters( 'fbgr2wp_content', $custom_data, $post, $author_id, $author_name, $link, $group_id );
+
             $content .= $custom_data;
         }
 
         return $content;
+    }
+
+    /**
+     * Add support for avatar in fb_group_post comment type
+     *
+     * @param  array $types
+     * @return array
+     */
+    function avatar_comment_type( $types ) {
+        $types[] = 'fb_group_post';
+
+        return $types;
+    }
+
+    /**
+     * Adds avatar image from facebook in comments
+     *
+     * @param  string $avatar
+     * @param  string $id_or_email
+     * @param  int $size
+     * @return string
+     */
+    function get_avatar( $avatar, $id_or_email, $size ) {
+
+        // it's not a comment
+        if ( ! is_object( $id_or_email ) ) {
+            return $avatar;
+        }
+
+        if ( empty( $id_or_email->comment_type ) || $id_or_email->comment_type != 'fb_group_post' ) {
+            return $avatar;
+        }
+
+        $profile_id = get_comment_meta( $id_or_email->comment_ID, '_fb_author_id', true );
+
+        if ( ! $profile_id ) {
+            return $avatar;
+        }
+
+        $image  = sprintf( 'http://graph.facebook.com/%1$d/picture?type=square&height=%2$s&width=%2$s', $profile_id, $size );
+        $avatar = sprintf( '<img src="%1$s" class="avatar avatar-44 photo avatar-default" height="%2$s" width="%2$s" />', $image, $size );
+
+        return $avatar;
     }
 
     /**
